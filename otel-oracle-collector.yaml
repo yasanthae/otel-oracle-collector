@@ -1,0 +1,207 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oracle-wallet
+  namespace: monitoring
+type: Opaque
+data:
+  cwallet.sso: <BASE64_ENCODED_WALLET_FILE>
+  sqlnet.ora: <BASE64_ENCODED_SQLNET_ORA_FILE>
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oracle-wallet-tns
+  namespace: monitoring
+data:
+  tnsnames.ora: |
+    <YOUR_TNS_ALIAS> = (description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1522)(host=<YOUR_ORACLE_HOST>))(connect_data=(service_name=<YOUR_SERVICE_NAME>))(security=(ssl_server_dn_match=yes)))
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: otel-oracle-secrets
+  namespace: monitoring
+type: Opaque
+stringData:
+  oracle-user: "<YOUR_ORACLE_USERNAME>"
+  oracle-password: "<YOUR_ORACLE_PASSWORD>"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: monitoring
+data:
+  otel-collector-config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      oracledb:
+        datasource: "oracle://<USERNAME>:<PASSWORD>@<HOST>:<PORT>/<SERVICE_NAME>?ssl=true&ssl%20verify=false"
+        collection_interval: 60s
+
+    processors:
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+      
+      resource:
+        attributes:
+          - key: service.name
+            value: oracle-metrics-collector
+            action: upsert
+          - key: deployment.environment
+            value: production
+            action: upsert
+          - key: oracle.instance
+            value: <YOUR_INSTANCE_NAME>
+            action: upsert
+
+    exporters:
+      otlp:
+        endpoint: "<YOUR_OTLP_ENDPOINT>:4317"
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+
+      debug:
+        verbosity: detailed
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        metrics:
+          receivers: [oracledb]
+          processors: [batch, resource]
+          exporters: [otlp, debug]
+
+      telemetry:
+        logs:
+          level: debug
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-oracle
+  namespace: monitoring
+  labels:
+    app: otel-collector-oracle
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector-oracle
+  template:
+    metadata:
+      labels:
+        app: otel-collector-oracle
+    spec:
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:0.115.1
+        command:
+          - "/otelcol-contrib"
+          - "--config=/conf/otel-collector-config.yaml"
+        ports:
+        - containerPort: 4317
+          name: otlp-grpc
+        - containerPort: 4318
+          name: otlp-http
+        - containerPort: 8888
+          name: metrics
+        env:
+        - name: TNS_ADMIN
+          value: "/wallet"
+        - name: ORACLE_HOME
+          value: "/wallet"
+        volumeMounts:
+        - name: otel-collector-config-vol
+          mountPath: /conf
+        - name: wallet-volume
+          mountPath: /wallet
+          readOnly: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 20
+          periodSeconds: 10
+      volumes:
+      - name: otel-collector-config-vol
+        configMap:
+          name: otel-collector-config
+          items:
+          - key: otel-collector-config.yaml
+            path: otel-collector-config.yaml
+      - name: wallet-volume
+        projected:
+          sources:
+          - secret:
+              name: oracle-wallet
+              items:
+              - key: cwallet.sso
+                path: cwallet.sso
+              - key: sqlnet.ora
+                path: sqlnet.ora
+          - configMap:
+              name: oracle-wallet-tns
+              items:
+              - key: tnsnames.ora
+                path: tnsnames.ora
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-oracle
+  namespace: monitoring
+  labels:
+    app: otel-collector-oracle
+spec:
+  type: ClusterIP
+  ports:
+  - port: 4317
+    targetPort: 4317
+    protocol: TCP
+    name: otlp-grpc
+  - port: 4318
+    targetPort: 4318
+    protocol: TCP
+    name: otlp-http
+  - port: 8888
+    targetPort: 8888
+    protocol: TCP
+    name: metrics
+  selector:
+    app: otel-collector-oracle
